@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+import config
 from agents import db
 from agents.enums import AutonomyTier, Channel, Urgency
 from data.database import get_session
 from data.models import Notification
+from llm import provider
 
 if TYPE_CHECKING:
     from agents.state import ReplenishmentState
@@ -66,6 +68,9 @@ class NotificationResult(BaseModel):
     po_number: str | None
     autonomy_tier: AutonomyTier | None
     status: str = "SENT"
+    body_source: str | None = Field(
+        None, description="Which path phrased the body: gemini / ollama / template."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +112,7 @@ def compose(state: "ReplenishmentState", recipient_name: str) -> NotificationRes
         po_number=po_number,
         autonomy_tier=tier,
         status="SENT",
+        body_source=provider.TEMPLATE,
     )
 
 
@@ -166,6 +172,54 @@ def _template(
 
 
 # ---------------------------------------------------------------------------
+# LLM phrasing (the LLM edge — optional, with a template fallback)
+# ---------------------------------------------------------------------------
+#: Tone guidance per tier so the LLM matches the DP's required attention level.
+_TONE_BY_TIER: dict[AutonomyTier, str] = {
+    AutonomyTier.AUTO_ISSUE: "calm and informational (FYI; no action needed)",
+    AutonomyTier.DRAFT_FOR_APPROVAL: "urgent and direct (action required: approve or reject)",
+    AutonomyTier.SUPPRESS: "reassuring and brief (no action; a potential false alarm was avoided)",
+}
+
+_BODY_SYSTEM = (
+    "You rewrite an internal supply-chain notification for a Demand Planner. "
+    "Preserve every fact exactly — SKU, quantities, vendor, PO number, stock "
+    "levels — and do NOT add any number, name, or claim that is not in the draft. "
+    "Keep it to 2-4 sentences, address the planner directly, and use no headings "
+    "or bullet points. Output only the message body."
+)
+
+
+def _rephrase_body(
+    result: "NotificationResult", tier: AutonomyTier
+) -> tuple[str, str]:
+    """Optionally rephrase the notification body with the LLM.
+
+    Args:
+        result: The composed result carrying the deterministic template body.
+        tier: The autonomy tier, used to set the tone.
+
+    Returns:
+        ``(body, source)`` — the LLM-phrased body and its provider, or the
+        original template body labelled ``template`` if the LLM is unavailable.
+
+    Rationale: the LLM only restyles tone over already-correct facts; the system
+        prompt forbids new data, and the template body is the fallback, so the
+        notification can never gain an invented fact or hard-fail.
+    """
+    prompt = (
+        f"Tone: {_TONE_BY_TIER.get(tier, 'professional')}.\n"
+        f"Channel: {result.channel.value}. Urgency: {result.urgency.value}.\n\n"
+        "Rewrite this draft notification body, keeping all facts identical:\n"
+        f"{result.body}"
+    )
+    gen = provider.generate_with_provider(
+        prompt, system=_BODY_SYSTEM, fallback=result.body
+    )
+    return gen.text, gen.provider
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 def run(
@@ -191,6 +245,12 @@ def run(
         recipient_name = dp.name if dp else "Demand Planner"
 
         result = compose(state, recipient_name)
+
+        # LLM edge (b): restyle the body's tone for the DP. Channel, urgency, and
+        # subject stay deterministic; only the prose is (optionally) rephrased.
+        if config.USE_LLM and state.decision is not None:
+            result.body, result.body_source = _rephrase_body(result, state.decision.tier)
+
         s.add(
             Notification(
                 recipient=dp.slack_handle if (dp and result.channel is Channel.SLACK) else (dp.email if dp else recipient_name),

@@ -1,10 +1,12 @@
 # Agents (Phase 1 — deterministic core)
 
-The six agents are pure, deterministic Python functions. **No LLM and no
-orchestration framework are involved in Phase 1** — every detection, forecast,
-and routing decision is reproducible arithmetic. (LLM-phrased justification and
-notification text, and the LangGraph human-in-the-loop interrupt, arrive in
-later phases.)
+The six agents are pure, deterministic Python functions for everything that
+matters to a decision. **No LLM touches detection, forecasting, or routing** —
+every such decision is reproducible arithmetic. The LLM is used at only two
+human-facing edges, both behind a deterministic template fallback: the draft
+justification narrative (Approval Agent) and the notification body (Notification
+Agent). See [`llm.md`](llm.md). The LangGraph human-in-the-loop interrupt is
+covered in [`orchestration.md`](orchestration.md).
 
 Each agent lives in `agents/<name>.py`, defines a pydantic **input model** and
 **output model**, and exposes `run(state, session=None) -> state`. All agents
@@ -106,14 +108,17 @@ Combines the three upstream verdicts into exactly one autonomy tier.
 
 - **Input** `ApprovalInput{ stock, forecast, vendor }`
 - **Output** `ApprovalDecision{ tier, reason, confidence, requires_human,
-  justification_payload, note }`
+  justification_payload, justification_narrative, narrative_source, note }`
 - **Rules** (priority order)
   1. `stock.signal == SUPPRESS` → **SUPPRESS** (overrides everything; never a PO)
   2. else `vendor.recommended_route == AUTO_ISSUE` → **AUTO_ISSUE**
   3. else → **DRAFT_FOR_APPROVAL**, `requires_human = True`, and assemble the
      **structured** `justification_payload` (on-hand, threshold,
-     days-to-stockout, promo/season pressure, vendor reason, MOQ, cost…). *Text
-     generation is a later phase; Phase 1 emits only the structured fields.*
+     days-to-stockout, promo/season pressure, vendor reason, MOQ, cost…). The
+     `classify()` step also attaches a deterministic template `justification_narrative`;
+     `run()` then upgrades that prose via the LLM on the draft path only (the routing
+     above is already final). `narrative_source` records which path wrote it. See
+     [`llm.md`](llm.md).
 - `confidence` is a fixed, deterministic value per outcome (suppress 0.97,
   auto 0.95, draft 0.60–0.80 by reason) — explainable, not probabilistic.
 

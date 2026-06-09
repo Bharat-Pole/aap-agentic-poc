@@ -140,6 +140,7 @@ def _human_approval_node(state: GraphState) -> dict:
         qty_needed=state.forecast.qty_needed if state.forecast else None,
         reason=state.decision.reason if state.decision else "vendor not approved",
         draft_justification=state.decision.justification_payload if state.decision else None,
+        draft_narrative=state.decision.justification_narrative if state.decision else None,
     )
     # Execution stops here until the run is resumed with Command(resume=...).
     raw = interrupt(request.model_dump())

@@ -69,6 +69,10 @@ class ApprovalRequest(BaseModel):
     draft_justification: dict[str, Any] | None = Field(
         None, description="Structured justification payload from the Approval Agent."
     )
+    draft_narrative: str | None = Field(
+        None,
+        description="Plain-language justification (LLM-written or template) for the planner.",
+    )
 
 
 class HumanDecision(BaseModel):

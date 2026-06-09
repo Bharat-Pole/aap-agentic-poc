@@ -91,9 +91,49 @@ SAFETY_BUFFER_FACTOR: float = float(os.getenv("POC_SAFETY_BUFFER_FACTOR", "1.0")
 #: (``PO-<year>-<seq>``). Kept distinct from the seeded open-PO numbering.
 PO_NUMBER_SEQ_BASE: int = int(os.getenv("POC_PO_SEQ_BASE", "90000"))
 
-# --- LLM (used only in later phases) -----------------------------------------
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
+# --- LLM (used ONLY at the two human-facing edges) ---------------------------
+# The LLM never touches detection, forecasting, or routing. It is used in exactly
+# two places — the draft-PO justification narrative (Approval Agent) and the
+# notification body phrasing (Notification Agent) — and always behind a
+# deterministic template fallback, so the POC completes every scenario offline.
+
+
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    """Parse a truthy environment string into a bool.
+
+    Args:
+        raw: The raw environment value (or None if unset).
+        default: Value to use when ``raw`` is None/empty.
+
+    Returns:
+        ``True`` for {1,true,yes,on} (case-insensitive), ``False`` otherwise.
+
+    Rationale: one parser keeps env-driven feature flags consistent and lets a
+    demo flip the whole LLM layer off with ``USE_LLM=false``.
+    """
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+#: Master switch for the LLM edges. When False, justification + notification text
+#: come straight from the deterministic templates — a fully offline, byte-stable
+#: demo. When True (default), the provider chain is tried first and degrades to
+#: the same templates if no provider is reachable.
+USE_LLM: bool = _parse_bool(os.getenv("USE_LLM"), default=True)
+
+#: Preferred provider tried first; the chain falls through to the other provider
+#: and then the template regardless. One of {"gemini", "ollama"}.
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY") or None
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5")
+
+#: (connect, read) timeouts in seconds for the Ollama HTTP call. A short connect
+#: timeout means an offline demo (nothing listening on 11434) fails over to the
+#: next provider almost instantly instead of stalling.
+OLLAMA_TIMEOUT: tuple[float, float] = (
+    float(os.getenv("POC_OLLAMA_CONNECT_TIMEOUT", "1.0")),
+    float(os.getenv("POC_OLLAMA_READ_TIMEOUT", "60.0")),
+)

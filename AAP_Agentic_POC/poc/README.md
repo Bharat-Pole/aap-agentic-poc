@@ -36,6 +36,9 @@ All detection, forecasting, and routing is **deterministic Python**. The LLM is 
 **only** for (a) drafting PO justification text on the draft path and (b) phrasing the
 notification. The LLM wrapper degrades gracefully: **Gemini 2.5 Flash → local Ollama →
 deterministic template**, so the demo never hard-fails and no API key is required to run.
+Set `USE_LLM=false` to force the fully deterministic template path for an offline demo.
+See [`docs/llm.md`](docs/llm.md) for the exact prompts, the fallback chain, and how to
+switch providers via `.env`.
 
 ## Project layout
 
@@ -44,11 +47,11 @@ poc/
   config.py          # shared seed + reference date + policy knobs + LLM settings
   data/              # SQLAlchemy models, engine/session, poc.db (generated)
   agents/            # the six agents + shared state, enums, db access, BY mock
-  orchestration/     # LangGraph state machine + HITL interrupt (later)
-  llm/               # provider-agnostic LLM wrapper (later)
+  orchestration/     # LangGraph state machine + HITL interrupt
+  llm/               # provider-agnostic LLM wrapper (Gemini -> Ollama -> template)
   ui/                # Streamlit DP dashboard (later)
-  scripts/           # seed_data.py, show_db.py, smoke_agents.py
-  docs/              # data_model.md, agents.md, decision_logic.md
+  scripts/           # seed_data.py, show_db.py, smoke_agents.py, validate_phase*.py
+  docs/              # data_model.md, agents.md, decision_logic.md, orchestration.md, llm.md
 ```
 
 ## Setup
@@ -147,5 +150,10 @@ state schema, and how interrupt/resume works.
   agents wired into a state graph with the three-way autonomy fork, the
   human-in-the-loop `interrupt`/resume on the draft path, batch consolidation
   (S3), and the `validate_phase2.py` acceptance gate (18 checks).
-- Later phases add the LLM wrapper (draft justification + notification phrasing)
-  and the Streamlit dashboard.
+- **Phase 3 — LLM edges (justification + notification text):** ✅ complete — the
+  provider-agnostic [`llm/provider.py`](llm/provider.py) wrapper (Gemini → Ollama →
+  template, never raises), the LLM-written draft justification narrative (Approval
+  Agent) and notification body (Notification Agent), the `USE_LLM` master switch,
+  [`docs/llm.md`](docs/llm.md), and the `validate_phase3.py` gate (13 checks). The
+  LLM never touches detection, forecasting, or routing.
+- Later phases add the Streamlit dashboard.

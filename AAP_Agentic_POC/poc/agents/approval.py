@@ -22,12 +22,14 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+import config
 from agents import db
 from agents.enums import AutonomyTier, DraftReason, StockSignal
 from agents.stock_monitor import StockStatus
 from agents.demand_forecast import ForecastResult
 from agents.vendor_checker import VendorAssessment
 from data.database import get_session
+from llm import provider
 
 if TYPE_CHECKING:
     from agents.state import ReplenishmentState
@@ -80,6 +82,13 @@ class ApprovalDecision(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     requires_human: bool
     justification_payload: dict[str, Any] | None = None
+    justification_narrative: str | None = Field(
+        None,
+        description="Plain-language 3-4 sentence rationale for the DP (draft path only).",
+    )
+    narrative_source: str | None = Field(
+        None, description="Which path wrote the narrative: gemini / ollama / template."
+    )
     note: str
 
 
@@ -144,7 +153,9 @@ def classify(
             ),
         )
 
-    # 3) Draft path -> assemble the structured justification payload.
+    # 3) Draft path -> assemble the structured justification payload and a
+    #    deterministic narrative. run() upgrades the narrative via the LLM when
+    #    enabled; classify() stays pure so direct callers still get usable prose.
     draft_reason = vendor.draft_reason or DraftReason.NO_APPROVED_VENDOR
     payload = _build_justification_payload(stock, forecast, vendor, draft_reason)
     return ApprovalDecision(
@@ -154,6 +165,8 @@ def classify(
         confidence=_CONFIDENCE_DRAFT.get(draft_reason, 0.7),
         requires_human=True,
         justification_payload=payload,
+        justification_narrative=_fallback_narrative(payload),
+        narrative_source=provider.TEMPLATE,
         note=f"DRAFT-FOR-APPROVAL ({draft_reason.value}): {vendor.note}",
     )
 
@@ -203,6 +216,108 @@ def _build_justification_payload(
 
 
 # ---------------------------------------------------------------------------
+# Justification narrative (the LLM edge — draft path only)
+# ---------------------------------------------------------------------------
+#: System instruction pinning the model to the supplied facts. The hard rule —
+#: "use ONLY the numbers given" — is what keeps an LLM out of the decision: it
+#: phrases the deterministic facts, it does not compute or invent them.
+_NARRATIVE_SYSTEM = (
+    "You are a supply-chain assistant writing for a Demand Planner at an "
+    "automotive-parts distributor. Write a concise 3-4 sentence justification for "
+    "a draft purchase order that needs human approval. Cover: why the PO is "
+    "needed, how urgent it is, and the vendor caveat that blocked auto-issue. "
+    "Use ONLY the figures provided below — do NOT invent SKUs, quantities, dates, "
+    "costs, or vendor names. Plain professional prose, no bullet points, no "
+    "headings, no preamble."
+)
+
+
+def _narrative_prompt(payload: dict[str, Any]) -> str:
+    """Render the structured justification fields into an LLM prompt.
+
+    Args:
+        payload: The deterministic fields from :func:`_build_justification_payload`.
+
+    Returns:
+        A labelled facts block the model is told to phrase (and not exceed).
+
+    Rationale: passing explicit ``label: value`` lines (rather than free text)
+        makes it easy for the model to stay on the given numbers and easy for a
+        reviewer to confirm nothing was invented.
+    """
+    days = payload.get("days_to_stockout")
+    days_txt = f"{days} days" if isinstance(days, (int, float)) else "unknown"
+    return (
+        "Facts (use only these):\n"
+        f"- SKU: {payload.get('sku')} ({payload.get('description')}, "
+        f"{payload.get('category')})\n"
+        f"- On hand: {payload.get('on_hand')} units; reorder threshold: "
+        f"{payload.get('reorder_threshold')}; effective stock: "
+        f"{payload.get('effective_stock')}\n"
+        f"- Estimated days to stockout: {days_txt}; weekly average demand: "
+        f"{payload.get('weekly_avg')}\n"
+        f"- Recommended order quantity: {payload.get('qty_needed')} units\n"
+        f"- Demand uplift applied: promo {payload.get('promo_uplift_pct')}%, "
+        f"season {payload.get('season_uplift_pct')}% "
+        f"(combined {payload.get('combined_uplift')}x)\n"
+        f"- Vendor: {payload.get('vendor_id')} — status "
+        f"{payload.get('vendor_status')}, approval {payload.get('approval_status')}, "
+        f"MOQ {payload.get('moq')}, unit cost {payload.get('unit_cost')}\n"
+        f"- Reason auto-issue was blocked: {payload.get('draft_reason')}\n"
+        f"- Approved alternative vendor available: "
+        f"{payload.get('approved_alternative_exists')}\n\n"
+        "Write the 3-4 sentence justification now."
+    )
+
+
+def _fallback_narrative(payload: dict[str, Any]) -> str:
+    """Build a deterministic 3-sentence narrative from the structured fields.
+
+    Args:
+        payload: The deterministic justification fields.
+
+    Returns:
+        A fixed-form rationale used when the LLM is disabled or unreachable.
+
+    Rationale: the template last resort — same facts, no model — so the draft
+        path always carries readable prose even fully offline.
+    """
+    days = payload.get("days_to_stockout")
+    days_txt = (
+        f"about {days} days" if isinstance(days, (int, float)) else "an unknown horizon"
+    )
+    return (
+        f"{payload.get('sku')} ({payload.get('description')}) has fallen to "
+        f"{payload.get('on_hand')} units against a reorder threshold of "
+        f"{payload.get('reorder_threshold')}, with {days_txt} of cover remaining. "
+        f"A replenishment of {payload.get('qty_needed')} units is recommended from "
+        f"{payload.get('vendor_id')}, but the order cannot be auto-issued because "
+        f"of '{payload.get('draft_reason')}'. Please review and approve before any "
+        f"PO is sent to the vendor."
+    )
+
+
+def _attach_narrative(decision: ApprovalDecision) -> None:
+    """Upgrade a draft decision's narrative via the LLM, in place.
+
+    Args:
+        decision: The draft :class:`ApprovalDecision` (mutated on success).
+
+    Rationale: the single LLM touch-point on the approval side — it only ever
+        rephrases the already-computed facts, so a provider outage or a disabled
+        LLM simply leaves the deterministic template narrative in place.
+    """
+    payload = decision.justification_payload or {}
+    result = provider.generate_with_provider(
+        _narrative_prompt(payload),
+        system=_NARRATIVE_SYSTEM,
+        fallback=decision.justification_narrative,
+    )
+    decision.justification_narrative = result.text
+    decision.narrative_source = result.provider
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 def run(
@@ -225,6 +340,11 @@ def run(
     """
     decision = classify(state.stock, state.forecast, state.vendor)
 
+    # LLM edge (a): phrase the draft justification for the DP. Routing above is
+    # already final and deterministic — this only writes prose, never decides.
+    if decision.tier is AutonomyTier.DRAFT_FOR_APPROVAL and config.USE_LLM:
+        _attach_narrative(decision)
+
     own = session is None
     s = session or get_session()
     try:
@@ -243,6 +363,8 @@ def run(
                 "confidence": decision.confidence,
                 "requires_human": decision.requires_human,
                 "justification_payload": decision.justification_payload,
+                "justification_narrative": decision.justification_narrative,
+                "narrative_source": decision.narrative_source,
             },
         )
         s.commit()

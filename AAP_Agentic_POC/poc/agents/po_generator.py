@@ -316,25 +316,33 @@ def _audit_written(session, run_id, result: POResult, sku: str) -> None:
 
 
 def _draft_justification_text(state: "ReplenishmentState") -> str:
-    """Produce a plain templated justification for an approved draft PO.
+    """Produce the justification text stored on an approved draft PO.
 
     Args:
-        state: Shared state with the draft justification payload.
+        state: Shared state with the draft decision (carrying the narrative).
 
     Returns:
-        A deterministic one-paragraph rationale.
+        The Approval Agent's justification narrative (LLM-written when enabled,
+        deterministic template otherwise), annotated with the approver.
 
-    Rationale: Phase 1 uses a fixed template; the LLM replaces this on the draft
-        path in a later phase (the only natural-language touch-point besides notifications).
+    Rationale: the narrative the planner read at the approval gate is exactly the
+        text persisted on the PO — one rationale, generated once on the draft path
+        (the only natural-language touch-points are this and the notification).
     """
-    p = (state.decision.justification_payload or {}) if state.decision else {}
-    return (
-        f"Draft PO for {p.get('sku')} ({p.get('description')}): on-hand "
-        f"{p.get('on_hand')} below threshold {p.get('reorder_threshold')}; "
-        f"~{p.get('days_to_stockout')} days to stockout. Recommended qty "
-        f"{p.get('qty_needed')} from {p.get('vendor_id')} "
-        f"(reason: {p.get('draft_reason')}). Approved by {state.approved_by}."
-    )
+    decision = state.decision
+    narrative = (decision.justification_narrative if decision else None) or ""
+    if not narrative.strip():
+        # Defensive: a draft should always carry a narrative, but never write a
+        # PO with an empty justification.
+        p = (decision.justification_payload or {}) if decision else {}
+        narrative = (
+            f"Draft PO for {p.get('sku')} ({p.get('description')}): on-hand "
+            f"{p.get('on_hand')} below threshold {p.get('reorder_threshold')}; "
+            f"~{p.get('days_to_stockout')} days to stockout. Recommended qty "
+            f"{p.get('qty_needed')} from {p.get('vendor_id')} "
+            f"(reason: {p.get('draft_reason')})."
+        )
+    return f"{narrative.strip()} (Approved by {state.approved_by}.)"
 
 
 # ---------------------------------------------------------------------------
