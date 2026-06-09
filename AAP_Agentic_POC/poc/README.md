@@ -106,11 +106,36 @@ python scripts/smoke_agents.py   # routes SKU-123 / 456 / 212 through agents 1�
 Expected — and asserted by the script: `SKU-123 → AUTO-ISSUE`,
 `SKU-456 → DRAFT-FOR-APPROVAL`, `SKU-212 → SUPPRESS`.
 
+## Orchestration (Phase 2)
+
+The six agents are wired into a **LangGraph state graph** with a conditional fork
+on the autonomy tier and a real **human-in-the-loop pause** on the draft path
+(LangGraph `interrupt` + checkpointer). The suppress branch skips the PO node
+entirely; the draft branch reaches the PO node only after a human resume.
+
+```bash
+python scripts/seed_data.py        # deterministic seed
+python scripts/validate_phase2.py  # re-seeds, then drives S1–S4 through the graph
+```
+
+```python
+from orchestration import runner
+runner.run_for_sku("SKU-123")                       # S1 auto-issue → completes
+o = runner.run_for_sku("SKU-456", thread_id="d456") # S2 draft → pauses
+runner.resume_run("d456", approved=True, approved_by="@dp")  # writes APPROVED PO
+runner.run_for_sku("SKU-212")                       # S4 suppress → no PO
+runner.run_batch([f"SKU-{n}" for n in range(701, 709)])      # S3 → 3 POs + 1 draft
+```
+
+See [`docs/orchestration.md`](docs/orchestration.md) for the graph diagram, the
+state schema, and how interrupt/resume works.
+
 ## Documentation
 
 - [`docs/data_model.md`](docs/data_model.md) — every table and column.
 - [`docs/agents.md`](docs/agents.md) — each agent's input/output schema and rules.
 - [`docs/decision_logic.md`](docs/decision_logic.md) — the conditions → route table.
+- [`docs/orchestration.md`](docs/orchestration.md) — the LangGraph graph, state, and HITL interrupt.
 
 ## Status
 
@@ -118,6 +143,9 @@ Expected — and asserted by the script: `SKU-123 → AUTO-ISSUE`,
 - **Phase 1 — Deterministic agent core (no LLM, no framework):** ✅ complete —
   the six agents, shared state, the Blue Yonder `write_po()` mock + guardrail, and
   the `smoke_agents.py` routing check.
-- Later phases add the LLM wrapper (draft justification + notification phrasing),
-  the LangGraph orchestration with the human-in-the-loop interrupt, and the
-  Streamlit dashboard.
+- **Phase 2 — LangGraph orchestration + autonomy routing:** ✅ complete — the six
+  agents wired into a state graph with the three-way autonomy fork, the
+  human-in-the-loop `interrupt`/resume on the draft path, batch consolidation
+  (S3), and the `validate_phase2.py` acceptance gate (18 checks).
+- Later phases add the LLM wrapper (draft justification + notification phrasing)
+  and the Streamlit dashboard.
