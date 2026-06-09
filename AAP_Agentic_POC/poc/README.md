@@ -41,14 +41,14 @@ deterministic template**, so the demo never hard-fails and no API key is require
 
 ```
 poc/
-  config.py          # shared seed + reference date + LLM settings
+  config.py          # shared seed + reference date + policy knobs + LLM settings
   data/              # SQLAlchemy models, engine/session, poc.db (generated)
-  agents/            # one module per agent (added in later phases)
+  agents/            # the six agents + shared state, enums, db access, BY mock
   orchestration/     # LangGraph state machine + HITL interrupt (later)
   llm/               # provider-agnostic LLM wrapper (later)
   ui/                # Streamlit DP dashboard (later)
-  scripts/           # seed_data.py, show_db.py
-  docs/              # data_model.md and design docs
+  scripts/           # seed_data.py, show_db.py, smoke_agents.py
+  docs/              # data_model.md, agents.md, decision_logic.md
 ```
 
 ## Setup
@@ -90,12 +90,34 @@ random seed + fixed reference date `2026-06-09`).
 | **S3** | SKU-701..708 | Confectionery (Diwali) | all below | AUTO-ISSUE ×7 + escalate | season +50%; consolidate by vendor; YZ1/708 suspended → draft |
 | **S4** | SKU-212 | Cooking Oil | 80/200 | SUPPRESS | open IN-TRANSIT PO-2025-00772 (1500u, ETA 2d) covers it |
 
+## The agents (Phase 1)
+
+The six agents are deterministic Python functions sharing one typed state object
+([`ReplenishmentState`](agents/state.py)); each reads/writes `poc.db` via
+[`agents/db.py`](agents/db.py) and appends to the immutable `audit_log`. No LLM
+and no orchestration framework yet — all detection, forecasting, and routing is
+reproducible arithmetic. Verify the routing core end-to-end:
+
+```bash
+python scripts/seed_data.py      # deterministic seed (drops & recreates poc.db)
+python scripts/smoke_agents.py   # routes SKU-123 / 456 / 212 through agents 1–4
+```
+
+Expected — and asserted by the script: `SKU-123 → AUTO-ISSUE`,
+`SKU-456 → DRAFT-FOR-APPROVAL`, `SKU-212 → SUPPRESS`.
+
 ## Documentation
 
 - [`docs/data_model.md`](docs/data_model.md) — every table and column.
+- [`docs/agents.md`](docs/agents.md) — each agent's input/output schema and rules.
+- [`docs/decision_logic.md`](docs/decision_logic.md) — the conditions → route table.
 
 ## Status
 
 - **Phase 0 — Repo scaffold + synthetic data layer:** ✅ complete.
-- Later phases add the LLM wrapper, the six agents, the LangGraph orchestration with the
-  human-in-the-loop interrupt, and the Streamlit dashboard.
+- **Phase 1 — Deterministic agent core (no LLM, no framework):** ✅ complete —
+  the six agents, shared state, the Blue Yonder `write_po()` mock + guardrail, and
+  the `smoke_agents.py` routing check.
+- Later phases add the LLM wrapper (draft justification + notification phrasing),
+  the LangGraph orchestration with the human-in-the-loop interrupt, and the
+  Streamlit dashboard.

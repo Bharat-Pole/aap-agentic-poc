@@ -113,7 +113,7 @@ def check_vendor(
         )
     else:
         route = AutonomyTier.DRAFT_FOR_APPROVAL
-        note = f"draft ({reason.value}): {_reason_detail(reason, appr, vendor, qty_needed, moq, has_alt)}"
+        note = _reason_detail(reason, appr, vendor, qty_needed, moq, has_alt)
 
     return VendorAssessment(
         sku=sku,
