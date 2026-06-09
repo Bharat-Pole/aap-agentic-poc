@@ -1,0 +1,19 @@
+# Agentic Inventory-Replenishment POC — Python dependencies (free / open-source only).
+# Pin only major-compatible ranges so the demo installs cleanly on Python 3.11+.
+
+pandas>=2.0
+numpy>=1.24
+faker>=22.0
+statsmodels>=0.14
+sqlalchemy>=2.0
+pydantic>=2.5
+langgraph>=0.2
+streamlit>=1.30
+requests>=2.31            # Ollama fallback HTTP client
+python-dotenv>=1.0
+
+# Optional — primary LLM provider (Gemini 2.5 Flash free tier).
+# The LLM wrapper degrades gracefully to Ollama and then to a deterministic
+# template if this is not installed or no key is present, so it is not required
+# for the data layer or for the demo to run.
+google-generativeai>=0.8 ; python_version >= "3.11"

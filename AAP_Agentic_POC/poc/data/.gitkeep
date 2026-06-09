@@ -1,0 +1,2 @@
+# Keeps the data/ directory under version control. poc.db is generated here
+# by scripts/seed_data.py and is git-ignored.
