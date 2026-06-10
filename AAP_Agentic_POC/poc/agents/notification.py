@@ -34,7 +34,14 @@ log = logging.getLogger("agents.notification")
 
 AGENT_NAME = "NotificationAgent"
 
-#: Channel + urgency per tier (deterministic; no LLM).
+#: Mock procurement desk — the recipient of an alternate-sourcing notice when a
+#: draft PO is rejected. No real message is sent; the row is persisted so the
+#: dashboard shows procurement was looped in (the "notify procurement" guardrail).
+PROCUREMENT_NAME = "Procurement Desk"
+PROCUREMENT_ADDRESS = "procurement@distributor.example"
+
+#: Channel + urgency per tier (deterministic; no LLM). The DRAFT tier is resolved
+#: per sub-case (awaiting / approved / rejected) rather than from this map.
 _CHANNEL_BY_TIER: dict[AutonomyTier, Channel] = {
     AutonomyTier.AUTO_ISSUE: Channel.SLACK,
     AutonomyTier.DRAFT_FOR_APPROVAL: Channel.EMAIL,
@@ -60,6 +67,11 @@ class NotificationResult(BaseModel):
     """Output contract: the notification record composed for the DP."""
 
     recipient: str
+    to_address: str | None = Field(
+        None,
+        description="Resolved delivery address/handle; overrides the DP lookup when set "
+        "(e.g. the procurement desk on a rejected draft).",
+    )
     channel: Channel
     urgency: Urgency
     subject: str
@@ -96,20 +108,119 @@ def compose(state: "ReplenishmentState", recipient_name: str) -> NotificationRes
         raise ValueError("NotificationAgent requires an Approval decision first.")
 
     tier = state.decision.tier
-    channel = _CHANNEL_BY_TIER[tier]
-    urgency = _URGENCY_BY_TIER[tier]
-    sku = state.sku
     po_number = state.po.po_number if state.po else None
+
+    # The draft tier resolves to one of three notices depending on the human
+    # ruling (still pending, approved, or rejected -> procurement).
+    if tier is AutonomyTier.DRAFT_FOR_APPROVAL:
+        return _compose_draft(state, recipient_name, po_number)
 
     subject, body = _template(state, tier, recipient_name, po_number)
     return NotificationResult(
         recipient=recipient_name,
-        channel=channel,
-        urgency=urgency,
+        to_address=None,
+        channel=_CHANNEL_BY_TIER[tier],
+        urgency=_URGENCY_BY_TIER[tier],
+        subject=subject,
+        body=body,
+        sku=state.sku,
+        po_number=po_number,
+        autonomy_tier=tier,
+        status="SENT",
+        body_source=provider.TEMPLATE,
+    )
+
+
+def _compose_draft(
+    state: "ReplenishmentState", recipient_name: str, po_number: str | None
+) -> NotificationResult:
+    """Compose the draft-path notice for the current human ruling.
+
+    Args:
+        state: Shared state (decision, forecast, vendor, po, HITL fields).
+        recipient_name: The Demand Planner display name (used pre-/post-approval).
+        po_number: The PO number if one was written (approved path).
+
+    Returns:
+        A :class:`NotificationResult` for one of three cases:
+        rejected -> alternate-sourcing notice to procurement; approved -> "PO
+        placed" to the DP; still pending -> "approve me" to the DP.
+
+    Rationale: a draft's notification must follow the human decision, not just the
+        tier — a rejection has to reach *procurement* (not the planner) with the
+        alternate-sourcing ask, which is the guardrail's reject-path obligation.
+    """
+    tier = AutonomyTier.DRAFT_FOR_APPROVAL
+    sku = state.sku
+    desc = state.stock.description if state.stock else sku
+    qty = state.forecast.qty_needed if state.forecast else None
+    vendor = state.vendor.primary_vendor_id if state.vendor else None
+    deadline = state.decision.approval_deadline if state.decision else None
+
+    if state.human_approved is False:  # explicit rejection -> procurement.
+        reason = state.rejection_reason or "rejected by reviewer"
+        subject = f"[Alternate sourcing] Draft PO for {sku} rejected — action needed"
+        body = (
+            f"Hi {PROCUREMENT_NAME}, the draft PO for {sku} ({desc}) — ~{qty} units "
+            f"from {vendor} — was rejected by the planner ({reason}). No PO was sent "
+            f"to {vendor}. Please arrange alternate sourcing; the SKU is still below "
+            f"its reorder point and needs cover."
+        )
+        return NotificationResult(
+            recipient=PROCUREMENT_NAME,
+            to_address=PROCUREMENT_ADDRESS,
+            channel=Channel.EMAIL,
+            urgency=Urgency.HIGH,
+            subject=subject,
+            body=body,
+            sku=sku,
+            po_number=None,
+            autonomy_tier=tier,
+            status="SENT",
+            body_source=provider.TEMPLATE,
+        )
+
+    if state.human_approved is True:  # approved -> PO placed, FYI to the DP.
+        subject = f"[Approved] PO {po_number} placed for {sku}"
+        body = (
+            f"Hi {recipient_name}, the draft PO for {sku} ({desc}) was approved"
+            + (f" by {state.approved_by}" if state.approved_by else "")
+            + f" and placed with {vendor}: {qty} units (PO {po_number}). "
+            f"No further action needed — sharing for visibility."
+        )
+        return NotificationResult(
+            recipient=recipient_name,
+            to_address=None,
+            channel=Channel.EMAIL,
+            urgency=Urgency.NORMAL,
+            subject=subject,
+            body=body,
+            sku=sku,
+            po_number=po_number,
+            autonomy_tier=tier,
+            status="SENT",
+            body_source=provider.TEMPLATE,
+        )
+
+    # Still pending a decision (e.g. notified at the gate) -> ask the DP to act.
+    reason = state.decision.reason if state.decision else "vendor not approved"
+    subject = f"[Action required] Approve draft PO for {sku}"
+    body = (
+        f"Hi {recipient_name}, {sku} ({desc}) breached its reorder point "
+        f"({state.stock.on_hand}/{state.stock.reorder_threshold}) and needs "
+        f"~{qty} units, but it cannot be auto-issued ({reason}). A draft PO to "
+        f"{vendor} is awaiting your approval before anything is sent"
+        + (f". SLA: please action by {deadline}." if deadline else ".")
+    )
+    return NotificationResult(
+        recipient=recipient_name,
+        to_address=None,
+        channel=_CHANNEL_BY_TIER[tier],
+        urgency=_URGENCY_BY_TIER[tier],
         subject=subject,
         body=body,
         sku=sku,
-        po_number=po_number,
+        po_number=None,
         autonomy_tier=tier,
         status="SENT",
         body_source=provider.TEMPLATE,
@@ -122,19 +233,20 @@ def _template(
     recipient_name: str,
     po_number: str | None,
 ) -> tuple[str, str]:
-    """Render the templated subject and body for a tier.
+    """Render the templated subject and body for the auto-issue / suppress tiers.
 
     Args:
         state: Shared state (decision, forecast, vendor, po).
-        tier: The autonomy tier.
+        tier: The autonomy tier (AUTO_ISSUE or SUPPRESS; drafts are composed by
+            :func:`_compose_draft`).
         recipient_name: DP display name.
         po_number: The PO number, if one was written.
 
     Returns:
         ``(subject, body)`` plain strings.
 
-    Rationale: deterministic phrasing for Phase 1; the LLM later replaces only
-        the body, leaving these facts intact as the ground truth.
+    Rationale: deterministic phrasing; the LLM later replaces only the body,
+        leaving these facts intact as the ground truth.
     """
     sku = state.sku
     desc = state.stock.description if state.stock else sku
@@ -148,15 +260,6 @@ def _template(
             f"({desc}): {qty} units to {vendor} (PO {po_number}). On-hand had "
             f"fallen to {state.stock.on_hand}/{state.stock.reorder_threshold}. "
             f"No action needed — sharing for visibility."
-        )
-    elif tier is AutonomyTier.DRAFT_FOR_APPROVAL:
-        reason = state.decision.reason if state.decision else "vendor not approved"
-        subject = f"[Action required] Approve draft PO for {sku}"
-        body = (
-            f"Hi {recipient_name}, {sku} ({desc}) breached its reorder point "
-            f"({state.stock.on_hand}/{state.stock.reorder_threshold}) and needs "
-            f"~{qty} units, but it cannot be auto-issued ({reason}). A draft PO "
-            f"to {vendor} is awaiting your approval before anything is sent."
         )
     else:  # SUPPRESS
         cover = state.forecast.weeks_of_cover if state.forecast else None
@@ -251,9 +354,15 @@ def run(
         if config.USE_LLM and state.decision is not None:
             result.body, result.body_source = _rephrase_body(result, state.decision.tier)
 
+        # A composed override (e.g. the procurement desk on a rejection) wins;
+        # otherwise deliver to the DP's handle/email per channel.
+        to_address = result.to_address or (
+            dp.slack_handle if (dp and result.channel is Channel.SLACK)
+            else (dp.email if dp else result.recipient)
+        )
         s.add(
             Notification(
-                recipient=dp.slack_handle if (dp and result.channel is Channel.SLACK) else (dp.email if dp else recipient_name),
+                recipient=to_address,
                 channel=result.channel.value,
                 subject=result.subject,
                 body=result.body,
@@ -272,12 +381,12 @@ def run(
             sku=result.sku,
             autonomy_tier=result.autonomy_tier.value if result.autonomy_tier else None,
             po_number=result.po_number,
-            summary=f"{result.sku}: notified {recipient_name} via {result.channel.value} ({result.urgency.value}).",
+            summary=f"{result.sku}: notified {result.recipient} via {result.channel.value} ({result.urgency.value}).",
             details=result.model_dump(mode="json"),
         )
         s.commit()
         state.notification = result
-        log.info("%s -> notified %s via %s", state.sku, recipient_name, result.channel.value)
+        log.info("%s -> notified %s via %s", state.sku, result.recipient, result.channel.value)
         return state
     finally:
         if own:

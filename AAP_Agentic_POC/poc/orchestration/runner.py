@@ -47,6 +47,11 @@ log = logging.getLogger("orchestration.runner")
 # a paused draft thread be resumed later by thread_id.
 _GRAPH = None
 
+# Maps a paused run_id -> its checkpointer thread_id, so approve()/reject() can
+# resume by the run_id a caller already holds (the demo/dashboard key on run_id).
+# Populated whenever run_for_sku leaves a run paused at the human gate.
+_PAUSED_THREADS: dict[str, str] = {}
+
 
 def get_graph():
     """Return the process-wide compiled graph, building it on first use.
@@ -61,6 +66,39 @@ def get_graph():
     if _GRAPH is None:
         _GRAPH = build_graph()
     return _GRAPH
+
+
+def reset_graph() -> None:
+    """Discard the cached graph and the paused-thread registry.
+
+    Rationale: the dashboard's "Run 6 AM scan" starts the day fresh — it re-seeds
+        the database, so the in-memory checkpointer (which still holds the prior
+        scan's paused threads) must be dropped too, or a stale thread_id could
+        resume against data that no longer exists.
+    """
+    global _GRAPH
+    _GRAPH = None
+    _PAUSED_THREADS.clear()
+
+
+def snapshot(thread_id: str) -> dict[str, Any]:
+    """Return the full checkpointed graph state for a run, for display.
+
+    Args:
+        thread_id: The checkpointer thread id of a completed or paused run.
+
+    Returns:
+        The graph's channel values (``stock`` / ``forecast`` / ``vendor`` /
+        ``decision`` / ``po`` / ``notification`` / HITL flags), or ``{}`` if the
+        thread is unknown.
+
+    Rationale: :class:`RunOutcome` is a flat summary; the dashboard cards need the
+        rich per-agent verdicts, and the checkpointer already holds them — so the
+        UI reads them here rather than re-running any agent (which would re-audit).
+    """
+    graph = get_graph()
+    snap = graph.get_state({"configurable": {"thread_id": thread_id}})
+    return dict(snap.values)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +119,14 @@ class RunOutcome(BaseModel):
     po_number: str | None = None
     po_written: bool = False
     notification_subject: str | None = None
+    approval_deadline: str | None = Field(
+        None, description="ISO SLA deadline surfaced for a CRITICAL-LOW draft, if any."
+    )
+    human_approved: bool | None = None
+    rejection_reason: str | None = None
+    alternate_sourcing: bool = Field(
+        False, description="True once a draft was rejected (procurement to source elsewhere)."
+    )
 
 
 class ConsolidatedPO(BaseModel):
@@ -140,6 +186,11 @@ def _outcome_from_state(run_id: str, thread_id: str, sku: str) -> RunOutcome:
     po = values.get("po")
     notif = values.get("notification")
     route = values.get("route")
+    decision = values.get("decision")
+    # Prefer the live decision's deadline; fall back to the paused interrupt payload.
+    deadline = getattr(decision, "approval_deadline", None) or (
+        (request or {}).get("approval_deadline") if request else None
+    )
     return RunOutcome(
         run_id=run_id,
         thread_id=thread_id,
@@ -151,6 +202,10 @@ def _outcome_from_state(run_id: str, thread_id: str, sku: str) -> RunOutcome:
         po_number=po.po_number if po else None,
         po_written=bool(po.written) if po else False,
         notification_subject=notif.subject if notif else None,
+        approval_deadline=deadline,
+        human_approved=values.get("human_approved"),
+        rejection_reason=values.get("rejection_reason"),
+        alternate_sourcing=bool(values.get("alternate_sourcing")),
     )
 
 
@@ -175,6 +230,10 @@ def run_for_sku(sku: str, run_id: str | None = None, thread_id: str | None = Non
     config = {"configurable": {"thread_id": tid}}
     graph.invoke(new_graph_input(sku, rid), config=config)
     outcome = _outcome_from_state(rid, tid, sku)
+    if outcome.paused_for_approval:
+        # Remember where this run paused so approve(run_id) / reject(run_id) can
+        # resume it without the caller having to track the thread_id separately.
+        _PAUSED_THREADS[rid] = tid
     log.info("run_for_sku %s -> %s (%s)", sku, outcome.status, outcome.route)
     return outcome
 
@@ -185,14 +244,16 @@ def resume_run(
     approved: bool,
     approved_by: str | None = None,
     note: str | None = None,
+    reason: str | None = None,
 ) -> RunOutcome:
     """Resume a paused draft run with a human decision.
 
     Args:
         thread_id: The thread id of the paused run (from its :class:`RunOutcome`).
         approved: Whether the human approves the draft PO.
-        approved_by: Approver handle, recorded on the PO if written.
-        note: Optional reviewer note.
+        approved_by: Approver/rejecter handle, recorded on the PO if written.
+        note: Optional reviewer note (approval path).
+        reason: Rejection reason (reject path); flags alternate sourcing.
 
     Returns:
         The completed :class:`RunOutcome`. The PO is written (status APPROVED)
@@ -214,14 +275,81 @@ def resume_run(
 
     sku = snap.values.get("sku")
     run_id = snap.values.get("run_id")
-    decision = HumanDecision(approved=approved, approved_by=approved_by, note=note)
+    decision = HumanDecision(
+        approved=approved, approved_by=approved_by, note=note, reason=reason
+    )
     graph.invoke(Command(resume=decision.model_dump()), config=config)
+    _PAUSED_THREADS.pop(run_id, None)  # no longer paused.
     outcome = _outcome_from_state(run_id, thread_id, sku)
     log.info(
         "resume_run %s approved=%s -> %s (PO %s)",
         sku, approved, outcome.status, outcome.po_number,
     )
     return outcome
+
+
+def _thread_for(run_id: str) -> str:
+    """Resolve the checkpointer thread id for a paused run_id.
+
+    Args:
+        run_id: The run correlation id a caller holds.
+
+    Returns:
+        The thread id to resume. Falls back to ``run_id`` itself, since
+        single-SKU runs use ``thread_id == run_id`` by convention.
+
+    Rationale: approve()/reject() take the run_id the dashboard already shows; the
+        registry hides the run_id->thread_id mapping behind that public verb.
+    """
+    return _PAUSED_THREADS.get(run_id, run_id)
+
+
+def approve(run_id: str, decision: str | None = None, note: str | None = None) -> RunOutcome:
+    """Approve a paused draft run; the PO Generator then writes the PO.
+
+    Args:
+        run_id: The paused run's correlation id (as shown to the planner).
+        decision: The approver's handle/identity (who signed off).
+        note: Optional free-text approval note, recorded on the PO and audit.
+
+    Returns:
+        The completed :class:`RunOutcome` carrying exactly one written, APPROVED PO.
+
+    Raises:
+        ValueError: If the run is not paused awaiting approval.
+
+    Rationale: the human-in-the-loop "yes" — the only way a draft tier ever
+        reaches Blue Yonder; resuming clears the interrupt and the guardrail in
+        the PO node permits the write because ``human_approved`` is now True.
+    """
+    return resume_run(
+        _thread_for(run_id), approved=True, approved_by=decision, note=note
+    )
+
+
+def reject(run_id: str, reason: str, decision: str | None = None) -> RunOutcome:
+    """Reject a paused draft run; no PO is written and procurement is notified.
+
+    Args:
+        run_id: The paused run's correlation id.
+        reason: Why the draft is rejected — logged and shown to procurement.
+        decision: Optional handle/identity of the rejecter.
+
+    Returns:
+        The completed :class:`RunOutcome`: no PO, ``alternate_sourcing`` set, and
+        a procurement notification recorded.
+
+    Raises:
+        ValueError: If the run is not paused awaiting approval.
+
+    Rationale: the human-in-the-loop "no" — the guardrail keeps Blue Yonder
+        untouched, the rejection reason is written to the immutable audit trail,
+        the alternate-sourcing flag is raised, and procurement is told to source
+        the SKU another way.
+    """
+    return resume_run(
+        _thread_for(run_id), approved=False, approved_by=decision, reason=reason
+    )
 
 
 # ---------------------------------------------------------------------------

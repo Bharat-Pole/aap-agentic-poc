@@ -49,6 +49,16 @@ class ReplenishmentState(BaseModel):
     approved_by: str | None = Field(
         None, description="Handle of the human approver (draft path)."
     )
+    human_note: str | None = Field(
+        None, description="Free-text note the human left when approving a draft."
+    )
+    rejection_reason: str | None = Field(
+        None, description="Reason the human gave when rejecting a draft (reject path)."
+    )
+    alternate_sourcing: bool = Field(
+        False,
+        description="Set True when a draft is rejected: procurement must source elsewhere.",
+    )
 
     # Per-agent output slots.
     stock: StockStatus | None = None

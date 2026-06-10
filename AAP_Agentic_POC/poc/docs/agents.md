@@ -108,17 +108,14 @@ Combines the three upstream verdicts into exactly one autonomy tier.
 
 - **Input** `ApprovalInput{ stock, forecast, vendor }`
 - **Output** `ApprovalDecision{ tier, reason, confidence, requires_human,
-  justification_payload, justification_narrative, narrative_source, note }`
+  justification_payload, note }`
 - **Rules** (priority order)
   1. `stock.signal == SUPPRESS` → **SUPPRESS** (overrides everything; never a PO)
   2. else `vendor.recommended_route == AUTO_ISSUE` → **AUTO_ISSUE**
   3. else → **DRAFT_FOR_APPROVAL**, `requires_human = True`, and assemble the
      **structured** `justification_payload` (on-hand, threshold,
-     days-to-stockout, promo/season pressure, vendor reason, MOQ, cost…). The
-     `classify()` step also attaches a deterministic template `justification_narrative`;
-     `run()` then upgrades that prose via the LLM on the draft path only (the routing
-     above is already final). `narrative_source` records which path wrote it. See
-     [`llm.md`](llm.md).
+     days-to-stockout, promo/season pressure, vendor reason, MOQ, cost…). *Text
+     generation is a later phase; Phase 1 emits only the structured fields.*
 - `confidence` is a fixed, deterministic value per outcome (suppress 0.97,
   auto 0.95, draft 0.60–0.80 by reason) — explainable, not probabilistic.
 

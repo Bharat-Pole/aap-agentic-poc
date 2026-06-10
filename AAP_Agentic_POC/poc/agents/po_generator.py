@@ -93,8 +93,38 @@ def _write_allowed(
     if tier is AutonomyTier.DRAFT_FOR_APPROVAL:
         if human_approved:
             return True, None
+        if human_approved is False:
+            return False, "draft rejected by human — alternate sourcing flagged, no write"
         return False, "draft awaiting human approval — no write"
     return False, "suppressed — guardrail forbids writing a PO"
+
+
+def _validate_required_fields(state: "ReplenishmentState", tier: AutonomyTier) -> None:
+    """Assert the fields a legitimate PO needs are present before any write.
+
+    Args:
+        state: Shared state carrying vendor, forecast, and approval context.
+        tier: The autonomy tier authorising the write.
+
+    Raises:
+        ValueError: If a required field is missing — a vendor and a positive
+            quantity are always required; an approved draft additionally requires
+            an approver handle so the PO is attributable to a human.
+
+    Rationale: the second half of the guardrail — even when the tier *permits* a
+        write, an order missing its vendor, quantity, or (on the draft path) its
+        approver must never reach Blue Yonder; we refuse loudly instead.
+    """
+    vendor = state.vendor
+    if vendor is None or not vendor.primary_vendor_id:
+        raise ValueError(f"Cannot write a PO for {state.sku}: no vendor on the assessment.")
+    qty = state.forecast.qty_needed if state.forecast else None
+    if qty is None or qty <= 0:
+        raise ValueError(f"Cannot write a PO for {state.sku}: no positive qty_needed.")
+    if tier is AutonomyTier.DRAFT_FOR_APPROVAL and not state.approved_by:
+        raise ValueError(
+            f"Cannot write an approved-draft PO for {state.sku}: no approver recorded."
+        )
 
 
 def _po_status(tier: AutonomyTier) -> str:
@@ -158,10 +188,8 @@ def generate_for_state(
         )
         return result
 
-    qty = state.forecast.qty_needed if state.forecast else None
-    if qty is None or qty <= 0:
-        raise ValueError(f"Cannot write a PO for {state.sku}: no positive qty_needed.")
-
+    _validate_required_fields(state, tier)
+    qty = state.forecast.qty_needed
     vendor = state.vendor
     po_number = db.next_po_number(session)
     status = _po_status(tier)

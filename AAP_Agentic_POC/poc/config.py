@@ -91,6 +91,12 @@ SAFETY_BUFFER_FACTOR: float = float(os.getenv("POC_SAFETY_BUFFER_FACTOR", "1.0")
 #: (``PO-<year>-<seq>``). Kept distinct from the seeded open-PO numbering.
 PO_NUMBER_SEQ_BASE: int = int(os.getenv("POC_PO_SEQ_BASE", "90000"))
 
+#: SLA window (hours) granted to a human to action a CRITICAL-LOW draft PO
+#: before it is considered overdue. The Approval Agent stamps an
+#: ``approval_deadline`` on critical-low drafts from this; no real timer fires in
+#: the POC — the deadline is stored and displayed so escalation is demonstrable.
+CRITICAL_DRAFT_SLA_HOURS: int = int(os.getenv("POC_CRITICAL_SLA_HOURS", "24"))
+
 # --- LLM (used ONLY at the two human-facing edges) ---------------------------
 # The LLM never touches detection, forecasting, or routing. It is used in exactly
 # two places — the draft-PO justification narrative (Approval Agent) and the

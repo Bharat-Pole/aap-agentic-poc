@@ -194,3 +194,5 @@ suspended-vendor SKU (SKU-708, Vendor-YZ1) is excluded from consolidation and ru
 through the real single-SKU graph, so it comes back **paused** like any other
 draft. Result for the seeded batch: `Vendor-PQR` (3 lines), `Vendor-STU` (2),
 `Vendor-VWX` (2) = 3 POs / 7 lines, plus SKU-708 paused.
+```
+```

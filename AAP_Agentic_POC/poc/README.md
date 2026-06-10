@@ -49,9 +49,9 @@ poc/
   agents/            # the six agents + shared state, enums, db access, BY mock
   orchestration/     # LangGraph state machine + HITL interrupt
   llm/               # provider-agnostic LLM wrapper (Gemini -> Ollama -> template)
-  ui/                # Streamlit DP dashboard (later)
+  ui/                # Streamlit DP dashboard (app.py + service/data_access/scenarios)
   scripts/           # seed_data.py, show_db.py, smoke_agents.py, validate_phase*.py
-  docs/              # data_model.md, agents.md, decision_logic.md, orchestration.md, llm.md
+  docs/              # data_model.md, agents.md, decision_logic.md, orchestration.md, llm.md, demo_script.md
 ```
 
 ## Setup
@@ -133,12 +133,69 @@ runner.run_batch([f"SKU-{n}" for n in range(701, 709)])      # S3 → 3 POs + 1 
 See [`docs/orchestration.md`](docs/orchestration.md) for the graph diagram, the
 state schema, and how interrupt/resume works.
 
+## Guardrails, human-in-the-loop & audit (Phase 4)
+
+The write guard, the human approve/reject loop, and the immutable audit trail are
+hardened and tested. The orchestration layer exposes two verbs that resume a paused
+draft by its `run_id`:
+
+```python
+from orchestration import runner
+o = runner.run_for_sku("SKU-456", run_id="r1")   # S2 draft → pauses
+runner.approve("r1", decision="@planner", note="ok")  # → exactly one APPROVED PO
+# …or, for a fresh draft:
+runner.reject("r2", reason="budget freeze")           # → no PO; procurement notified
+```
+
+* **`approve`** writes exactly one PO (`status=APPROVED`), attributed to the
+  approver; **`reject`** writes nothing, raises the alternate-sourcing flag, logs the
+  reason, and notifies the (mock) procurement desk.
+* A **SUPPRESS** run never writes a PO; the `SUPPRESSED` audit event embeds the
+  effective-stock arithmetic that justified it.
+* A **CRITICAL-LOW draft** gets an `approval_deadline` (SLA stub) surfaced on the
+  interrupt for the dashboard.
+
+```bash
+python -m pytest                   # guardrail / audit / HITL suites (18 tests)
+python scripts/validate_phase4.py  # the deterministic Phase-4 acceptance gate (17 checks)
+```
+
+See [`docs/guardrails.md`](docs/guardrails.md) (autonomy tiers, the PO-write guard,
+required-field validation) and [`docs/audit.md`](docs/audit.md) (event types + an
+example trail per scenario).
+
+## The dashboard (Phase 5)
+
+The **Streamlit Demand-Planner console** is the stakeholder demo. One **Run 6 AM
+scan** button re-seeds the warehouse, runs the Stock Monitor across every SKU, and
+executes all four scenarios through the orchestration runner — then the worklist
+shows one colour-coded card per result (**AUTO-ISSUED / NEEDS APPROVAL /
+SUPPRESSED**). Draft cards carry the LLM justification, the 90-day offtake chart,
+and **Approve / Reject** buttons that resume the graph. A live **Blue Yonder (mock)**
+panel shows the `blue_yonder_po` table updating the instant an auto-issue or an
+approval writes a PO, alongside **Notifications** and **Audit trail** tabs.
+
+```bash
+python scripts/seed_data.py    # optional — the scan re-seeds on each click
+streamlit run ui/app.py
+```
+
+The UI is presentation-only: all run/approve/reject logic goes through
+[`ui/service.py`](ui/service.py) over the orchestration runner, and every panel reads
+through the read-only views in [`ui/data_access.py`](ui/data_access.py). State is held
+server-side in `st.session_state` (no browser storage). See
+[`docs/demo_script.md`](docs/demo_script.md) for the click-by-click walkthrough of all
+four scenarios.
+
 ## Documentation
 
 - [`docs/data_model.md`](docs/data_model.md) — every table and column.
 - [`docs/agents.md`](docs/agents.md) — each agent's input/output schema and rules.
 - [`docs/decision_logic.md`](docs/decision_logic.md) — the conditions → route table.
 - [`docs/orchestration.md`](docs/orchestration.md) — the LangGraph graph, state, and HITL interrupt.
+- [`docs/guardrails.md`](docs/guardrails.md) — autonomy tiers, the PO-write guard, required-field validation.
+- [`docs/audit.md`](docs/audit.md) — audit event types and an example trail for each scenario.
+- [`docs/demo_script.md`](docs/demo_script.md) — click-by-click dashboard walkthrough of all four scenarios.
 
 ## Status
 
@@ -156,4 +213,14 @@ state schema, and how interrupt/resume works.
   Agent) and notification body (Notification Agent), the `USE_LLM` master switch,
   [`docs/llm.md`](docs/llm.md), and the `validate_phase3.py` gate (13 checks). The
   LLM never touches detection, forecasting, or routing.
-- Later phases add the Streamlit dashboard.
+- **Phase 4 — Guardrails, human-in-the-loop & audit hardening:** ✅ complete — the
+  PO-write guard, the `approve`/`reject` resume verbs, the immutable `audit_log`
+  triggers, the CRITICAL-LOW SLA stub, [`docs/guardrails.md`](docs/guardrails.md),
+  [`docs/audit.md`](docs/audit.md), the pytest suites, and the `validate_phase4.py`
+  gate (17 checks).
+- **Phase 5 — Streamlit Demand-Planner dashboard:** ✅ complete — the
+  [`ui/app.py`](ui/app.py) console (6 AM scan, scenario filter, colour-coded
+  worklist cards, draft approve/reject with justification + 90-day chart, live Blue
+  Yonder panel, notifications + audit tabs) over [`ui/service.py`](ui/service.py) and
+  the read-only [`ui/data_access.py`](ui/data_access.py), plus the
+  [`docs/demo_script.md`](docs/demo_script.md) walkthrough.

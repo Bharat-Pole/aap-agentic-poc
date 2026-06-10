@@ -34,6 +34,7 @@ from langgraph.types import interrupt
 
 from agents import (
     approval,
+    db,
     demand_forecast,
     notification,
     po_generator,
@@ -41,6 +42,7 @@ from agents import (
     vendor_checker,
 )
 from agents.enums import AutonomyTier
+from data.database import get_session
 from orchestration.state import ApprovalRequest, GraphState, HumanDecision
 
 log = logging.getLogger("orchestration.graph")
@@ -126,30 +128,91 @@ def _human_approval_node(state: GraphState) -> dict:
         state: Graph state carrying the draft decision and justification payload.
 
     Returns:
-        The ``human_approved`` and ``approved_by`` channel updates, set from the
-        decision the caller resumes with.
+        The HITL channel updates (``human_approved`` / ``approved_by`` /
+        ``human_note`` / ``rejection_reason`` / ``alternate_sourcing``), set from
+        the decision the caller resumes with.
 
     Rationale: :func:`interrupt` suspends the graph *before* any PO write, so a
         draft can never reach Blue Yonder without an explicit human resume — the
-        guardrail enforced structurally by the graph, not just by convention.
+        guardrail enforced structurally by the graph, not just by convention. The
+        decision is committed to the audit trail here (the body after the
+        interrupt runs exactly once, on resume) so every human ruling is evidence.
     """
+    dec = state.decision
     request = ApprovalRequest(
         run_id=state.run_id,
         sku=state.sku,
         vendor_id=state.vendor.primary_vendor_id if state.vendor else None,
         qty_needed=state.forecast.qty_needed if state.forecast else None,
-        reason=state.decision.reason if state.decision else "vendor not approved",
-        draft_justification=state.decision.justification_payload if state.decision else None,
-        draft_narrative=state.decision.justification_narrative if state.decision else None,
+        reason=dec.reason if dec else "vendor not approved",
+        is_critical=dec.is_critical if dec else False,
+        approval_deadline=dec.approval_deadline if dec else None,
+        draft_justification=dec.justification_payload if dec else None,
+        draft_narrative=dec.justification_narrative if dec else None,
     )
     # Execution stops here until the run is resumed with Command(resume=...).
     raw = interrupt(request.model_dump())
     decision = raw if isinstance(raw, HumanDecision) else HumanDecision.model_validate(raw)
+    alternate_sourcing = not decision.approved
     log.info(
         "%s -> human decision: approved=%s by=%s",
         state.sku, decision.approved, decision.approved_by,
     )
-    return {"human_approved": decision.approved, "approved_by": decision.approved_by}
+    _audit_human_decision(state, decision, alternate_sourcing)
+    return {
+        "human_approved": decision.approved,
+        "approved_by": decision.approved_by,
+        "human_note": decision.note,
+        "rejection_reason": decision.reason if not decision.approved else None,
+        "alternate_sourcing": alternate_sourcing,
+    }
+
+
+def _audit_human_decision(
+    state: GraphState, decision: HumanDecision, alternate_sourcing: bool
+) -> None:
+    """Append the human approve/reject ruling to the immutable audit trail.
+
+    Args:
+        state: Graph state for the paused draft (supplies run_id / sku / vendor).
+        decision: The :class:`HumanDecision` the run was resumed with.
+        alternate_sourcing: Whether the rejection flagged alternate sourcing.
+
+    Rationale: the human gate is a first-class decision event — recorded with the
+        approver and their note (approve) or reason (reject) so the trail shows
+        exactly who unblocked, or blocked, each draft PO.
+    """
+    approved = decision.approved
+    event_type = "APPROVAL_GRANTED" if approved else "APPROVAL_REJECTED"
+    if approved:
+        summary = (
+            f"{state.sku}: draft APPROVED by {decision.approved_by or 'unknown'}"
+            + (f" — {decision.note}" if decision.note else "")
+        )
+    else:
+        summary = (
+            f"{state.sku}: draft REJECTED by {decision.approved_by or 'unknown'}"
+            f" — {decision.reason or 'no reason given'}; alternate sourcing flagged."
+        )
+    with get_session() as s:
+        db.append_audit(
+            s,
+            run_id=state.run_id,
+            agent="HumanApproval",
+            event_type=event_type,
+            sku=state.sku,
+            vendor_id=state.vendor.primary_vendor_id if state.vendor else None,
+            autonomy_tier=AutonomyTier.DRAFT_FOR_APPROVAL.value,
+            summary=summary,
+            details={
+                "approved": approved,
+                "approved_by": decision.approved_by,
+                "note": decision.note,
+                "rejection_reason": decision.reason if not approved else None,
+                "alternate_sourcing": alternate_sourcing,
+            },
+        )
+        s.commit()
 
 
 def _po_node(state: GraphState) -> dict:

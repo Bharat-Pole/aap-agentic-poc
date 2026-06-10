@@ -203,7 +203,7 @@ Demand Planners the **Notification Agent** can target — one per sub-category.
 ## Seeded volumes (from a clean `seed_data.py`)
 
 - **14 vendors** (8 named for scenarios + 6 generic approved pool).
-- **51 SKUs** — 11 scenario anchors (`SKU-123`, `SKU-456`, `SKU-701..708`, `SKU-212`) +
+- **52 SKUs** — 12 scenario anchors (`SKU-123`, `SKU-456`, `SKU-701..708`, `SKU-212`) +
   40 healthy background SKUs above threshold.
 - **90 days** of `sales_offtake` per SKU.
 - **8 season-index** rows, **8 Demand Planners**, **1 open PO** (S4).

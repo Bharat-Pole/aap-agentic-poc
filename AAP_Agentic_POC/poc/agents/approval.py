@@ -17,6 +17,7 @@ No LLM is involved — this is the routing logic the whole guardrail rests on.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
@@ -81,6 +82,13 @@ class ApprovalDecision(BaseModel):
     reason: str = Field(..., description="Why this tier, in one phrase.")
     confidence: float = Field(..., ge=0.0, le=1.0)
     requires_human: bool
+    is_critical: bool = Field(
+        False, description="True when the breach was CRITICAL-LOW (drives the SLA)."
+    )
+    approval_deadline: str | None = Field(
+        None,
+        description="ISO deadline by which a CRITICAL-LOW draft must be actioned (SLA stub).",
+    )
     justification_payload: dict[str, Any] | None = None
     justification_narrative: str | None = Field(
         None,
@@ -158,17 +166,39 @@ def classify(
     #    enabled; classify() stays pure so direct callers still get usable prose.
     draft_reason = vendor.draft_reason or DraftReason.NO_APPROVED_VENDOR
     payload = _build_justification_payload(stock, forecast, vendor, draft_reason)
+    is_critical = stock.signal is StockSignal.CRITICAL_LOW
+    deadline = _approval_deadline() if is_critical else None
     return ApprovalDecision(
         sku=sku,
         tier=AutonomyTier.DRAFT_FOR_APPROVAL,
         reason=draft_reason.value,
         confidence=_CONFIDENCE_DRAFT.get(draft_reason, 0.7),
         requires_human=True,
+        is_critical=is_critical,
+        approval_deadline=deadline,
         justification_payload=payload,
         justification_narrative=_fallback_narrative(payload),
         narrative_source=provider.TEMPLATE,
-        note=f"DRAFT-FOR-APPROVAL ({draft_reason.value}): {vendor.note}",
+        note=(
+            f"DRAFT-FOR-APPROVAL ({draft_reason.value}): {vendor.note}"
+            + (f" SLA: action by {deadline}." if deadline else "")
+        ),
     )
+
+
+def _approval_deadline() -> str:
+    """Compute the SLA deadline for a CRITICAL-LOW draft (escalation stub).
+
+    Returns:
+        An ISO-8601 timestamp ``CRITICAL_DRAFT_SLA_HOURS`` after the reference
+        "today" (midnight), as a string for storage/display.
+
+    Rationale: a critical breach awaiting human approval must not sit forever; the
+        POC records a concrete deadline (no live timer) so the dashboard can show
+        the SLA and a future scheduler could escalate against it deterministically.
+    """
+    base = datetime.combine(config.REFERENCE_DATE, time.min)
+    return (base + timedelta(hours=config.CRITICAL_DRAFT_SLA_HOURS)).isoformat()
 
 
 def _build_justification_payload(
@@ -345,6 +375,30 @@ def run(
     if decision.tier is AutonomyTier.DRAFT_FOR_APPROVAL and config.USE_LLM:
         _attach_narrative(decision)
 
+    details: dict[str, Any] = {
+        "tier": decision.tier.value,
+        "reason": decision.reason,
+        "confidence": decision.confidence,
+        "requires_human": decision.requires_human,
+        "is_critical": decision.is_critical,
+        "approval_deadline": decision.approval_deadline,
+        "justification_payload": decision.justification_payload,
+        "justification_narrative": decision.justification_narrative,
+        "narrative_source": decision.narrative_source,
+    }
+    # A SUPPRESSED event must carry the exact effective-stock arithmetic that
+    # justified *not* ordering — it is the audit's defence against "why no PO?".
+    if decision.tier is AutonomyTier.SUPPRESS and state.stock is not None:
+        st = state.stock
+        details["effective_stock_calc"] = {
+            "on_hand": st.on_hand,
+            "in_transit_qty": st.in_transit_qty,
+            "effective_stock": st.effective_stock,
+            "reorder_threshold": st.reorder_threshold,
+            "covers_threshold": st.effective_stock >= st.reorder_threshold,
+            "in_transit_refs": [ref.model_dump(mode="json") for ref in st.in_transit_refs],
+        }
+
     own = session is None
     s = session or get_session()
     try:
@@ -357,15 +411,7 @@ def run(
             vendor_id=state.vendor.primary_vendor_id,
             autonomy_tier=decision.tier.value,
             summary=f"{decision.sku}: {decision.tier.display} — {decision.reason}",
-            details={
-                "tier": decision.tier.value,
-                "reason": decision.reason,
-                "confidence": decision.confidence,
-                "requires_human": decision.requires_human,
-                "justification_payload": decision.justification_payload,
-                "justification_narrative": decision.justification_narrative,
-                "narrative_source": decision.narrative_source,
-            },
+            details=details,
         )
         s.commit()
         state.decision = decision

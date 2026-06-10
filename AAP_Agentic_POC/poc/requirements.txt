@@ -11,6 +11,7 @@ langgraph>=0.2
 streamlit>=1.30
 requests>=2.31            # Ollama fallback HTTP client
 python-dotenv>=1.0
+pytest>=8.0               # guardrail / audit / human-in-the-loop tests (Phase 4)
 
 # Optional — primary LLM provider (Gemini 2.5 Flash free tier).
 # The LLM wrapper degrades gracefully to Ollama and then to a deterministic

@@ -66,6 +66,13 @@ class ApprovalRequest(BaseModel):
     vendor_id: str | None
     qty_needed: int | None
     reason: str = Field(..., description="Why this SKU could not be auto-issued.")
+    is_critical: bool = Field(
+        False, description="True when the breach was CRITICAL-LOW (an SLA applies)."
+    )
+    approval_deadline: str | None = Field(
+        None,
+        description="ISO deadline by which a critical draft must be actioned (SLA stub).",
+    )
     draft_justification: dict[str, Any] | None = Field(
         None, description="Structured justification payload from the Approval Agent."
     )
@@ -84,9 +91,13 @@ class HumanDecision(BaseModel):
 
     approved: bool = Field(..., description="True to approve the draft PO, False to reject.")
     approved_by: str | None = Field(
-        None, description="Handle of the approver; recorded on the written PO."
+        None, description="Handle of the approver/rejecter; recorded on the written PO."
     )
     note: str | None = Field(None, description="Optional free-text reviewer note.")
+    reason: str | None = Field(
+        None,
+        description="Rejection reason (reject path); drives the alternate-sourcing flag.",
+    )
 
 
 def new_graph_input(sku: str, run_id: str | None = None) -> dict[str, Any]:
